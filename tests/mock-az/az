@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+# Mock Azure CLI for offline testing of azure-logging-compliance-audit.sh
+import sys, json, re, os, urllib.parse
+
+args = sys.argv[1:]
+LOG = os.environ.get("MOCK_AZ_LOG")
+if LOG:
+    with open(LOG, "a") as f:
+        f.write(json.dumps(args) + "\n")
+
+T = "11111111-1111-1111-1111-111111111111"
+S1 = "aaaaaaaa-0000-0000-0000-000000000001"
+S2 = "aaaaaaaa-0000-0000-0000-000000000002"
+S3 = "aaaaaaaa-0000-0000-0000-000000000003"
+RG = f"/subscriptions/{S1}/resourceGroups/rg-logging"
+LAW = f"{RG}/providers/Microsoft.OperationalInsights/workspaces/law-sec-prod"
+NS = f"{RG}/providers/Microsoft.EventHub/namespaces/eh-vigre-sec-prod"
+SA = f"{RG}/providers/Microsoft.Storage/storageAccounts/stlogsprod"
+KV = f"/subscriptions/{S1}/resourceGroups/rg-app/providers/Microsoft.KeyVault/vaults/kv-prod"
+PG = f"/subscriptions/{S1}/resourceGroups/rg-app/providers/Microsoft.DBforPostgreSQL/flexibleServers/pg-prod"
+SQL = f"/subscriptions/{S1}/resourceGroups/rg-app/providers/Microsoft.Sql/servers/sql-prod"
+SQLDB = f"{SQL}/databases/appdb"
+APPI = f"/subscriptions/{S1}/resourceGroups/rg-app/providers/Microsoft.Insights/components/appi-uwwb"
+DBW = f"/subscriptions/{S1}/resourceGroups/rg-data/providers/Microsoft.Databricks/workspaces/dbw-prod"
+VM = f"/subscriptions/{S1}/resourceGroups/rg-app/providers/Microsoft.Compute/virtualMachines/vm1"
+DISK = f"/subscriptions/{S1}/resourceGroups/rg-app/providers/Microsoft.Compute/disks/vm1-os"
+
+def out(obj):
+    print(json.dumps(obj)); sys.exit(0)
+def err(msg, code=1):
+    sys.stderr.write("ERROR: " + msg + "\n"); sys.exit(code)
+def nf(): err('Not Found({"error":{"code":"ResourceNotFound","message":"not found"}})')
+def forbidden(): err('Forbidden({"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action"}})')
+
+if args[:1] == ["version"]:
+    out({"azure-cli": "2.99.0-mock", "azure-cli-core": "2.99.0-mock", "extensions": {}})
+if args[:2] == ["account", "show"]:
+    if os.environ.get("MOCK_UNAUTH"): err("Please run 'az login' to setup account.")
+    out({"id": S1, "tenantId": T, "environmentName": "AzureCloud", "user": {"name": "someone@example.com", "type": "user"}})
+if args[:2] == ["account", "list"]:
+    out([{"id": S1, "name": "VIGRE PROD", "state": "Enabled", "tenantId": T},
+         {"id": S2, "name": "VIGRE DEV", "state": "Enabled", "tenantId": T},
+         {"id": S3, "name": "OLD", "state": "Disabled", "tenantId": T},
+         {"id": "bbbbbbbb-0000-0000-0000-000000000009", "name": "Foreign", "state": "Enabled", "tenantId": "22222222-2222-2222-2222-222222222222"}])
+if args[:2] == ["cloud", "show"]:
+    out({"name": "AzureCloud", "endpoints": {"resourceManager": "https://management.azure.com/", "microsoftGraphResourceId": "https://graph.microsoft.com/"}})
+if args[:1] != ["rest"]:
+    err("mock: unsupported command " + " ".join(args))
+
+def opt(name):
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args): return args[i + 1]
+    return None
+method = (opt("--method") or "get").lower()
+url = opt("--url")
+body = opt("--body")
+if body and body.startswith("@"):
+    body = json.load(open(body[1:]))
+u = urllib.parse.urlparse(url)
+path = urllib.parse.unquote(u.path)
+lp = path.lower()
+q = urllib.parse.parse_qs(u.query)
+
+thr = os.environ.get("MOCK_THROTTLE_DIR")
+if thr and lp.endswith("kv-prod/providers/microsoft.insights/diagnosticsettings"):
+    c = os.path.join(thr, "kv"); n = int(open(c).read()) if os.path.exists(c) else 0
+    open(c, "w").write(str(n + 1))
+    if n < 2: err('Too Many Requests({"error":{"code":"TooManyRequests"}})')
+if os.environ.get("MOCK_UNAUTH") and args[:2] == ["account", "show"]:
+    pass
+if method not in ("get", "post"):
+    err("mock: write method attempted: " + method, 99)
+
+# ---- Resource Graph ----
+if lp == "/providers/microsoft.resourcegraph/resources":
+    sub = body["subscriptions"][0]
+    if sub == S2: forbidden()
+    def r(id_, typ, kind=None, sku="", props=None, tags=None):
+        return {"id": id_, "name": id_.split("/")[-1], "type": typ.lower(), "kind": kind, "location": "westeurope",
+                "resourceGroup": id_.split("/")[4], "subscriptionId": S1, "skuName": sku, "skuTier": "", "tags": tags or {},
+                "properties": props}
+    data = [
+        r(LAW, "Microsoft.OperationalInsights/workspaces", props={"customerId": "0000aaaa-1111-2222-3333-444455556666"}),
+        r(NS, "Microsoft.EventHub/namespaces", sku="Standard"),
+        r(SA, "Microsoft.Storage/storageAccounts", kind="StorageV2", sku="Standard_LRS"),
+        r(KV, "Microsoft.KeyVault/vaults", sku="standard", tags={"environment": "prod"}),
+        r(PG, "Microsoft.DBforPostgreSQL/flexibleServers", sku="Standard_D2s_v3"),
+        r(SQL, "Microsoft.Sql/servers", kind="v12.0"),
+        r(SQLDB, "Microsoft.Sql/servers/databases", kind="v12.0,user", sku="GP_Gen5"),
+        r(APPI, "Microsoft.Insights/components", kind="web", props={"WorkspaceResourceId": LAW, "IngestionMode": "LogAnalytics", "InstrumentationKey": "secret-ikey-123", "ConnectionString": "InstrumentationKey=secret-ikey-123;IngestionEndpoint=x"}),
+        r(DBW, "Microsoft.Databricks/workspaces", sku="premium", props={"workspaceUrl": "adb-1.azuredatabricks.net"}),
+        r(VM, "Microsoft.Compute/virtualMachines"),
+        r(DISK, "Microsoft.Compute/disks"),
+    ]
+    out({"totalRecords": len(data), "count": len(data), "data": data, "resultTruncated": "false"})
+
+if lp == f"/subscriptions/{S2}/resources":
+    forbidden()
+
+# ---- Log Analytics query ----
+if "api.loganalytics.io" in url:
+    qtext = body["query"]
+    if qtext.startswith("Usage"):
+        rows = [["SigninLogs", "2026-09-24T10:00:00Z", 120.5], ["AzureActivity", "2026-09-24T10:00:00Z", 3.2],
+                ["AppRequests", "2026-09-24T10:00:00Z", 50.0], ["AzureDiagnostics", "2026-09-24T10:00:00Z", 10.0],
+                ["UWWB_Audit_CL", "2026-09-24T10:00:00Z", 1.0], ["Heartbeat", "2026-09-24T10:00:00Z", 1.0],
+                ["MyDebug_CL", "2026-09-24T10:00:00Z", 0.5]]
+        out({"tables": [{"name": "PrimaryResult", "columns": [{"name": "DataType", "type": "string"}, {"name": "LastSeen", "type": "datetime"}, {"name": "VolumeMB", "type": "real"}], "rows": rows}]})
+    if qtext.startswith("AzureDiagnostics"):
+        out({"tables": [{"name": "PrimaryResult", "columns": [{"name": "ResourceProvider", "type": "string"}, {"name": "Category", "type": "string"}, {"name": "Records", "type": "long"}], "rows": [["MICROSOFT.KEYVAULT", "AuditEvent", 1234]]}]})
+    err("mock: bad query")
+
+if method == "post":
+    err("mock: unexpected POST " + url, 99)
+
+# ---- Microsoft Graph ----
+if "graph.microsoft.com" in url:
+    if "/groups/g-dev" in path: out({"id": "g-dev", "displayName": "DEV Team"})
+    if "/groups/g-data" in path: out({"id": "g-data", "displayName": "DATA Team"})
+    if "/serviceprincipals/" in lp: out({"id": "sp-1", "displayName": "sp-terraform"})
+    nf()
+
+# ---- Entra ----
+if lp.startswith("/providers/microsoft.aadiam"):
+    forbidden()
+
+def cat(name, typ="Logs", groups=None):
+    return {"name": name, "properties": {"categoryType": typ, "categoryGroups": groups or []}}
+
+# ---- Diagnostic settings categories ----
+if lp.endswith("/providers/microsoft.insights/diagnosticsettingscategories"):
+    base = lp[: -len("/providers/microsoft.insights/diagnosticsettingscategories")]
+    if base == f"/subscriptions/{S1}".lower():
+        out({"value": [cat(c) for c in ["Administrative", "Security", "ServiceHealth", "Alert", "Recommendation", "Policy", "Autoscale", "ResourceHealth"]]})
+    if base == KV.lower():
+        out({"value": [cat("AuditEvent", groups=["audit", "allLogs"]), cat("AzurePolicyEvaluationDetails", groups=["allLogs"]), cat("AllMetrics", "Metrics")]})
+    if base == PG.lower():
+        out({"value": [cat("PostgreSQLLogs", groups=["allLogs"]), cat("PostgreSQLFlexSessions", groups=["allLogs"]), cat("AllMetrics", "Metrics")]})
+    if base == DBW.lower():
+        out({"value": [cat(c, groups=["allLogs"]) for c in ["accounts", "workspace", "clusters", "jobs", "notebook", "unityCatalog"]]})
+    if base.endswith("/databases/master") or base == SQLDB.lower():
+        out({"value": [cat("SQLSecurityAuditEvents", groups=["audit", "allLogs"]), cat("DevOpsOperationsAudit", groups=["audit", "allLogs"]), cat("Errors", groups=["allLogs"]), cat("Basic", "Metrics")]})
+    if base == LAW.lower():
+        out({"value": [cat("Audit", groups=["audit", "allLogs"]), cat("SummaryLogs", groups=["allLogs"])]})
+    if base == NS.lower():
+        out({"value": [cat("OperationalLogs", groups=["allLogs"]), cat("RuntimeAuditLogs", groups=["audit", "allLogs"])]})
+    if base == APPI.lower():
+        out({"value": [cat("AppRequests", groups=["allLogs"]), cat("AppEvents", groups=["allLogs"])]})
+    if base.startswith(SA.lower() + "/"):
+        out({"value": [cat("StorageRead", groups=["audit", "allLogs"]), cat("StorageWrite", groups=["audit", "allLogs"]), cat("StorageDelete", groups=["audit", "allLogs"]), cat("Transaction", "Metrics")]})
+    if base == SA.lower():
+        out({"value": [cat("Transaction", "Metrics")]})
+    if base == VM.lower():
+        err('BadRequest({"error":{"code":"ResourceTypeNotSupported","message":"The resource type \'microsoft.compute/virtualmachines\' does not support diagnostic settings."}})')
+    out({"value": []})
+
+def ds(name, logs, ws=None, sa=None, ehrule=None, ehname=None, dedicated=False, metrics=False):
+    p = {"logs": logs, "metrics": [{"category": "AllMetrics", "enabled": metrics}]}
+    if ws: p["workspaceId"] = ws
+    if sa: p["storageAccountId"] = sa
+    if ehrule: p["eventHubAuthorizationRuleId"] = ehrule
+    if ehname: p["eventHubName"] = ehname
+    if dedicated: p["logAnalyticsDestinationType"] = "Dedicated"
+    return {"id": "x/" + name, "name": name, "properties": p}
+
+if lp.endswith("/providers/microsoft.insights/diagnosticsettings"):
+    base = lp[: -len("/providers/microsoft.insights/diagnosticsettings")]
+    if base == f"/subscriptions/{S1}".lower():
+        out({"value": [ds("activity-to-law", [{"category": "Administrative", "enabled": True}, {"category": "Security", "enabled": True}], ws=LAW, sa=SA)]})
+    if base == KV.lower():
+        out({"value": [ds("kv-diag", [{"category": "AuditEvent", "enabled": True}], ws=LAW, sa=SA)]})
+    if base == DBW.lower():
+        out({"value": [ds("dbw-diag", [{"category": "accounts", "enabled": True}, {"category": "workspace", "enabled": True}], ws=LAW, dedicated=True)]})
+    if base.endswith("sql-prod/databases/master"):
+        out({"value": [ds("SQLSecurityAuditEvents_3d229c42", [{"categoryGroup": "audit", "enabled": True}], ws=LAW)]})
+    if base == (SA + "/blobServices/default").lower():
+        out({"value": [ds("blob-diag", [{"categoryGroup": "allLogs", "enabled": True}], ws=LAW, dedicated=True)]})
+    if base == SQLDB.lower():
+        forbidden()
+    if base == VM.lower():
+        err('BadRequest({"error":{"code":"ResourceTypeNotSupported","message":"does not support diagnostic settings"}})')
+    out({"value": []})
+
+# ---- LAW ----
+if lp == LAW.lower():
+    out({"id": LAW, "name": "law-sec-prod", "location": "westeurope", "properties": {"customerId": "0000aaaa-1111-2222-3333-444455556666", "sku": {"name": "PerGB2018"}, "retentionInDays": 365, "workspaceCapping": {"dailyQuotaGb": -1}, "publicNetworkAccessForIngestion": "Enabled", "publicNetworkAccessForQuery": "Enabled", "features": {"enableLogAccessUsingOnlyResourcePermissions": True}}})
+def tbl(name, plan="Analytics", ret=365, dflt=True, total=None, ttype="Microsoft", cols=None):
+    p = {"plan": plan, "retentionInDays": ret, "retentionInDaysAsDefault": dflt, "totalRetentionInDays": total or ret, "totalRetentionInDaysAsDefault": dflt, "archiveRetentionInDays": 0, "schema": {"name": name, "tableType": ttype, "tableSubType": "Any"}}
+    if cols: p["schema"]["columns"] = [{"name": c, "type": "string"} for c in cols]
+    return {"id": LAW + "/tables/" + name, "name": name, "properties": p}
+if lp == LAW.lower() + "/tables":
+    if "skiptoken" in q:
+        out({"value": [tbl("Heartbeat", plan="Basic", ret=30, dflt=False, total=365)]})
+    out({"value": [tbl("SigninLogs"), tbl("AzureActivity", ret=730, dflt=False), tbl("AppRequests"), tbl("AzureDiagnostics"),
+                   tbl("MyDebug_CL", ret=90, dflt=False, ttype="CustomLog"), tbl("UWWB_Audit_CL", ttype="CustomLog", cols=["TimeGenerated", "Operation", "EntityId", "RequestBody"]),
+                   tbl("AuditLogs"), tbl("Usage", ret=90)],
+         "nextLink": "https://management.azure.com" + LAW + "/tables?api-version=2022-10-01&skiptoken=2"})
+if lp == LAW.lower() + "/dataexports":
+    out({"value": [{"id": LAW + "/dataExports/export-soc", "name": "export-soc", "properties": {"enable": True, "tableNames": ["SigninLogs", "AzureActivity", "OldTable"], "destination": {"resourceId": NS, "type": "EventHub"}}}]})
+
+# ---- Event Hub ----
+if lp == NS.lower():
+    out({"id": NS, "name": "eh-vigre-sec-prod", "location": "westeurope", "sku": {"name": "Standard", "tier": "Standard", "capacity": 2},
+         "properties": {"publicNetworkAccess": "Enabled", "minimumTlsVersion": "1.2", "disableLocalAuth": False, "isAutoInflateEnabled": True, "maximumThroughputUnits": 10, "privateEndpointConnections": []}})
+if lp == NS.lower() + "/networkrulesets/default":
+    out({"properties": {"defaultAction": "Deny", "publicNetworkAccess": "Enabled", "trustedServiceAccessEnabled": False, "ipRules": [{"ipMask": "1.2.3.4"}], "virtualNetworkRules": []}})
+if lp == NS.lower() + "/authorizationrules":
+    out({"value": [{"name": "RootManageSharedAccessKey", "properties": {"rights": ["Listen", "Manage", "Send"]}}]})
+if lp == NS.lower() + "/eventhubs":
+    out({"value": [{"id": NS + "/eventhubs/am-signinlogs", "name": "am-signinlogs", "properties": {"partitionCount": 4, "messageRetentionInDays": 1, "status": "Active"}},
+                   {"id": NS + "/eventhubs/am-azureactivity", "name": "am-azureactivity", "properties": {"partitionCount": 2, "messageRetentionInDays": 1, "status": "Active",
+                     "captureDescription": {"enabled": True, "destination": {"name": "EventHubArchive.AzureBlockBlob", "properties": {"storageAccountResourceId": SA, "blobContainer": "capture"}}}}}]})
+if lp.endswith("/consumergroups"):
+    out({"value": [{"name": "$Default"}, {"name": "cribl-prod"}]})
+if lp.startswith(NS.lower() + "/eventhubs/") and lp.endswith("/authorizationrules"):
+    out({"value": []})
+if lp == NS.lower() + "/providers/microsoft.insights/metrics":
+    def ts(h, inc, outg):
+        return [{"metadatavalues": [{"name": {"value": "entityname"}, "value": h}], "data": [{"total": inc}]}], [{"metadatavalues": [{"name": {"value": "entityname"}, "value": h}], "data": [{"total": outg}]}]
+    a1, b1 = ts("am-signinlogs", 5000, 0)
+    a2, b2 = ts("am-azureactivity", 100, 0)
+    out({"value": [{"name": {"value": "IncomingMessages"}, "timeseries": a1 + a2}, {"name": {"value": "OutgoingMessages"}, "timeseries": b1 + b2}]})
+
+# ---- Storage ----
+if lp == SA.lower():
+    out({"id": SA, "name": "stlogsprod", "location": "westeurope", "kind": "StorageV2", "sku": {"name": "Standard_LRS"},
+         "properties": {"isHnsEnabled": False, "minimumTlsVersion": "TLS1_2", "supportsHttpsTrafficOnly": True, "publicNetworkAccess": "Enabled",
+                        "networkAcls": {"defaultAction": "Allow"}, "allowBlobPublicAccess": False, "allowSharedKeyAccess": True}})
+if lp == SA.lower() + "/blobservices/default":
+    out({"properties": {"isVersioningEnabled": True, "deleteRetentionPolicy": {"enabled": True, "days": 14}, "containerDeleteRetentionPolicy": {"enabled": False}, "changeFeed": {"enabled": False}}})
+if lp == SA.lower() + "/managementpolicies/default":
+    err('Not Found({"error":{"code":"ManagementPolicyNotFound"}})')
+if lp == SA.lower() + "/blobservices/default/containers":
+    out({"value": [
+        {"id": SA + "/blobServices/default/containers/insights-logs-auditevent", "name": "insights-logs-auditevent",
+         "properties": {"hasImmutabilityPolicy": True, "hasLegalHold": False, "immutabilityPolicy": {"properties": {"immutabilityPeriodSinceCreationInDays": 365, "state": "Unlocked", "allowProtectedAppendWrites": True}}}},
+        {"id": SA + "/blobServices/default/containers/insights-activity-logs", "name": "insights-activity-logs",
+         "properties": {"hasImmutabilityPolicy": True, "hasLegalHold": False}},
+        {"id": SA + "/blobServices/default/containers/tfstate", "name": "tfstate", "properties": {"hasImmutabilityPolicy": False}}]})
+if lp == (SA + "/blobServices/default/containers/insights-activity-logs/immutabilityPolicies/default").lower():
+    out({"properties": {"immutabilityPeriodSinceCreationInDays": 2190, "state": "Locked", "allowProtectedAppendWritesAll": True}})
+
+# ---- PostgreSQL ----
+if lp == PG.lower() + "/configurations":
+    out({"value": [{"name": "shared_preload_libraries", "properties": {"value": "pg_cron,pg_stat_statements"}},
+                   {"name": "log_connections", "properties": {"value": "on"}}, {"name": "log_disconnections", "properties": {"value": "off"}},
+                   {"name": "pgaudit.log", "properties": {"value": "none"}}]})
+
+# ---- SQL ----
+if lp == SQL.lower() + "/auditingsettings/default":
+    out({"properties": {"state": "Enabled", "isAzureMonitorTargetEnabled": True, "storageEndpoint": "", "retentionDays": 0,
+                        "auditActionsAndGroups": ["SUCCESSFUL_DATABASE_AUTHENTICATION_GROUP", "FAILED_DATABASE_AUTHENTICATION_GROUP", "BATCH_COMPLETED_GROUP"]}})
+if lp == SQL.lower() + "/devopsauditingsettings/default":
+    out({"properties": {"state": "Disabled"}})
+
+# ---- RBAC ----
+if lp.endswith("/providers/microsoft.authorization/roledefinitions"):
+    out({"value": [
+        {"name": "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", "properties": {"roleName": "Owner", "type": "BuiltInRole", "permissions": [{"actions": ["*"], "notActions": []}]}},
+        {"name": "b24988ac-6180-42a0-ab88-20f7382dd24c", "properties": {"roleName": "Contributor", "type": "BuiltInRole", "permissions": [{"actions": ["*"], "notActions": ["Microsoft.Authorization/*/Delete", "Microsoft.Authorization/*/Write"]}]}},
+        {"name": "73c42c96-874c-492b-b04d-ab87d138a893", "properties": {"roleName": "Log Analytics Reader", "type": "BuiltInRole", "permissions": [{"actions": ["*/read", "Microsoft.OperationalInsights/workspaces/search/action", "Microsoft.Support/*"], "notActions": []}]}}]})
+if lp.endswith("/providers/microsoft.authorization/roleassignments"):
+    scope = lp[: -len("/providers/microsoft.authorization/roleassignments")]
+    if scope == LAW.lower():
+        def ra(i, pid, ptype, role, sc):
+            return {"id": f"{sc}/providers/Microsoft.Authorization/roleAssignments/{i}", "properties": {"principalId": pid, "principalType": ptype, "scope": sc,
+                    "roleDefinitionId": f"/subscriptions/{S1}/providers/Microsoft.Authorization/roleDefinitions/{role}"}}
+        out({"value": [ra("a1", "u-1", "User", "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", f"/subscriptions/{S1}"),
+                       ra("a2", "g-dev", "Group", "73c42c96-874c-492b-b04d-ab87d138a893", LAW),
+                       ra("a3", "g-data", "Group", "b24988ac-6180-42a0-ab88-20f7382dd24c", RG)]})
+    if scope == SA.lower():
+        forbidden()
+    out({"value": []})
+if lp.endswith("/roleeligibilityscheduleinstances"):
+    out({"value": []})
+
+nf()
